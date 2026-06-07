@@ -3,6 +3,9 @@ class App {
     this.nodeId = this._generateNodeId();
     this.configSync = null;
     this.editingKey = null;
+    this.passwordCallback = null;
+    this.rollbackTargetNodeId = null;
+    this.rollbackChanges = [];
 
     this._initElements();
     this._initEventListeners();
@@ -70,6 +73,25 @@ class App {
     this.importTextarea = document.getElementById('importTextarea');
     this.cancelImportBtn = document.getElementById('cancelImportBtn');
     this.confirmImportBtn = document.getElementById('confirmImportBtn');
+
+    this.passwordModal = document.getElementById('passwordModal');
+    this.passwordModalTitle = document.getElementById('passwordModalTitle');
+    this.passwordPathLabel = document.getElementById('passwordPathLabel');
+    this.passwordPath = document.getElementById('passwordPath');
+    this.passwordInput = document.getElementById('passwordInput');
+    this.confirmPasswordInput = document.getElementById('confirmPasswordInput');
+    this.confirmPasswordHint = document.getElementById('confirmPasswordHint');
+    this.passwordError = document.getElementById('passwordError');
+    this.cancelPasswordBtn = document.getElementById('cancelPasswordBtn');
+    this.confirmPasswordBtn = document.getElementById('confirmPasswordBtn');
+
+    this.rollbackModal = document.getElementById('rollbackModal');
+    this.rollbackTargetId = document.getElementById('rollbackTargetId');
+    this.rollbackTargetInfo = document.getElementById('rollbackTargetInfo');
+    this.rollbackMessage = document.getElementById('rollbackMessage');
+    this.rollbackChangesList = document.getElementById('rollbackChangesList');
+    this.cancelRollbackBtn = document.getElementById('cancelRollbackBtn');
+    this.confirmRollbackBtn = document.getElementById('confirmRollbackBtn');
   }
 
   _initEventListeners() {
@@ -93,6 +115,12 @@ class App {
     this.cancelImportBtn.addEventListener('click', () => this._hideImportModal());
     this.confirmImportBtn.addEventListener('click', () => this._confirmImport());
 
+    this.cancelPasswordBtn.addEventListener('click', () => this._hidePasswordModal());
+    this.confirmPasswordBtn.addEventListener('click', () => this._confirmPassword());
+
+    this.cancelRollbackBtn.addEventListener('click', () => this._hideRollbackModal());
+    this.confirmRollbackBtn.addEventListener('click', () => this._confirmRollback());
+
     this.addConfigModal.addEventListener('click', (e) => {
       if (e.target === this.addConfigModal) this._hideAddModal();
     });
@@ -101,6 +129,12 @@ class App {
     });
     this.importModal.addEventListener('click', (e) => {
       if (e.target === this.importModal) this._hideImportModal();
+    });
+    this.passwordModal.addEventListener('click', (e) => {
+      if (e.target === this.passwordModal) this._hidePasswordModal();
+    });
+    this.rollbackModal.addEventListener('click', (e) => {
+      if (e.target === this.rollbackModal) this._hideRollbackModal();
     });
 
     this.testNestedBtn.addEventListener('click', () => this._testNestedMerge());
@@ -154,14 +188,16 @@ class App {
   _setupConfigSyncListeners() {
     this.configSync.on('config-changed', (data) => {
       const changeDesc = data.key || data.path || '';
-      this._log(`配置变更: ${changeDesc} ${data.remote ? '(远程)' : '(本地)'}`, data.remote ? 'info' : 'success');
+      const prefix = data.rollback ? '🔄 ' : (data.encryptionChanged ? '🔐 ' : '');
+      this._log(`${prefix}配置变更: ${changeDesc} ${data.remote ? '(远程)' : '(本地)'}`, data.remote ? 'info' : 'success');
       this._updateUI();
     });
 
     this.configSync.on('operation-applied', (data) => {
       const source = data.local ? '本地' : `远程(${data.from})`;
       const conflict = data.conflict ? ' [冲突已解决]' : '';
-      this._log(`操作应用 [${source}]: ${data.operation.type} ${data.operation.path || data.operation.key}${conflict}`, data.conflict ? 'warning' : 'info');
+      const decryptError = data.decryptionError ? ' [解密失败]' : '';
+      this._log(`操作应用 [${source}]: ${data.operation.type} ${data.operation.path || data.operation.key}${conflict}${decryptError}`, data.conflict || data.decryptionError ? 'warning' : 'info');
     });
 
     this.configSync.on('peer-connected', (data) => {
@@ -209,6 +245,33 @@ class App {
 
     this.configSync.on('history-changed', () => {
       this._updateHistory();
+    });
+
+    this.configSync.on('encryption-required', (data) => {
+      this._log(`需要密码解密: ${data.path}`, 'warning');
+      this._showPasswordModal(data.path, 'unlock', (password) => {
+        this.configSync.unlockPath(data.path, password);
+      });
+    });
+
+    this.configSync.on('decryption-error', (data) => {
+      this._log(`解密失败: ${data.path} - ${data.error}`, 'error');
+    });
+
+    this.configSync.on('encryption-enabled', (data) => {
+      this._log(`🔐 已启用加密: ${data.path}${data.unlocked ? ' (已解锁)' : ''}`, 'success');
+      this._updateUI();
+    });
+
+    this.configSync.on('encryption-disabled', (data) => {
+      this._log(`🔓 已禁用加密: ${data.path}`, 'info');
+      this._updateUI();
+    });
+
+    this.configSync.on('rollback-complete', (data) => {
+      const source = data.remote ? `远程(${data.from})` : '本地';
+      this._log(`⏪ 版本回滚完成 [${source}]: ${data.targetNodeId.slice(-8)} (${data.changes.length} 项变更)`, 'success');
+      this._updateUI();
     });
   }
 
@@ -260,7 +323,7 @@ class App {
     this.editingKey = null;
   }
 
-  _confirmAddConfig() {
+  async _confirmAddConfig() {
     const key = this.configKeyInput.value.trim();
     const valueStr = this.configValueInput.value.trim();
     const message = this.configMsgInput.value.trim();
@@ -279,7 +342,7 @@ class App {
       const value = JSON.parse(valueStr);
 
       if (this.configSync) {
-        const op = this.configSync.set(key, value, message);
+        const op = await this.configSync.set(key, value, message);
         if (op) {
           this._log(`配置已${this.editingKey ? '更新' : '添加'}: ${key} = ${JSON.stringify(value)}`, 'success');
         }
@@ -295,15 +358,38 @@ class App {
     this._showAddModal(key);
   }
 
-  _deleteConfig(key) {
+  async _deleteConfig(key) {
     if (confirm(`确定要删除配置项 "${key}" 吗？`)) {
       if (this.configSync) {
-        const op = this.configSync.delete(key, `删除 ${key}`);
+        const op = await this.configSync.delete(key, `删除 ${key}`);
         if (op) {
           this._log(`配置已删除: ${key}`, 'warning');
         }
       }
     }
+  }
+
+  _setEncryption(key) {
+    const isEncrypted = this.configSync.isPathEncrypted(key);
+    const hasKey = this.configSync.hasKeyForPath(key);
+
+    if (isEncrypted && hasKey) {
+      if (confirm(`确定要移除 "${key}" 的加密保护吗？`)) {
+        this.configSync.removePasswordForPath(key);
+      }
+      return;
+    }
+
+    if (isEncrypted && !hasKey) {
+      this._showPasswordModal(key, 'unlock', (password) => {
+        this.configSync.unlockPath(key, password);
+      });
+      return;
+    }
+
+    this._showPasswordModal(key, 'encrypt', (password) => {
+      this.configSync.setPasswordForPath(key, password);
+    });
   }
 
   _undo() {
@@ -366,6 +452,219 @@ class App {
         this._log(`导入失败: ${result.error}`, 'error');
       }
     }
+  }
+
+  _showPasswordModal(path, mode, callback) {
+    this.passwordCallback = callback;
+    this.passwordPath.value = path;
+    this.passwordInput.value = '';
+    this.confirmPasswordInput.value = '';
+    this.passwordError.style.display = 'none';
+    this.passwordError.textContent = '';
+
+    if (mode === 'encrypt') {
+      this.passwordModalTitle.textContent = '🔐 设置加密密码';
+      this.passwordPathLabel.textContent = '要加密的配置路径';
+      this.confirmPasswordInput.style.display = 'block';
+      this.confirmPasswordHint.style.display = 'inline';
+    } else if (mode === 'unlock') {
+      this.passwordModalTitle.textContent = '🔓 输入解密密码';
+      this.passwordPathLabel.textContent = '要解密的配置路径';
+      this.confirmPasswordInput.style.display = 'none';
+      this.confirmPasswordHint.style.display = 'none';
+    }
+
+    this.passwordModal.classList.add('show');
+    setTimeout(() => this.passwordInput.focus(), 100);
+  }
+
+  _hidePasswordModal() {
+    this.passwordModal.classList.remove('show');
+    this.passwordCallback = null;
+  }
+
+  async _confirmPassword() {
+    const path = this.passwordPath.value;
+    const password = this.passwordInput.value;
+    const confirmPassword = this.confirmPasswordInput.value;
+    const mode = this.confirmPasswordInput.style.display === 'none' ? 'unlock' : 'encrypt';
+
+    if (!password) {
+      this._showPasswordError('请输入密码');
+      return;
+    }
+
+    if (mode === 'encrypt' && password !== confirmPassword) {
+      this._showPasswordError('两次输入的密码不一致');
+      return;
+    }
+
+    if (mode === 'encrypt' && password.length < 6) {
+      this._showPasswordError('密码长度至少6位');
+      return;
+    }
+
+    if (this.passwordCallback) {
+      try {
+        const result = await this.passwordCallback(password);
+        if (result === false) {
+          this._showPasswordError('密码错误，请重试');
+          return;
+        }
+        this._hidePasswordModal();
+      } catch (e) {
+        this._showPasswordError(e.message || '操作失败');
+      }
+    }
+  }
+
+  _showPasswordError(message) {
+    this.passwordError.textContent = message;
+    this.passwordError.style.display = 'block';
+  }
+
+  _showRollbackModal(nodeId) {
+    if (!this.configSync) return;
+
+    const node = this.configSync.getHistoryNode(nodeId);
+    if (!node) {
+      this._log('找不到指定的历史版本', 'error');
+      return;
+    }
+
+    this.rollbackTargetNodeId = nodeId;
+    this.rollbackTargetId.value = nodeId;
+    this.rollbackMessage.value = '';
+
+    const nodeDate = new Date(node.timestamp).toLocaleString();
+    this.rollbackTargetInfo.innerHTML = `
+      <div class="rollback-info-item">
+        <strong>版本ID:</strong> ${node.id}
+      </div>
+      <div class="rollback-info-item">
+        <strong>类型:</strong> ${node.type.toUpperCase()}
+      </div>
+      <div class="rollback-info-item">
+        <strong>消息:</strong> ${this._escapeHtml(node.message)}
+      </div>
+      <div class="rollback-info-item">
+        <strong>时间:</strong> ${nodeDate}
+      </div>
+      <div class="rollback-info-item">
+        <strong>父节点:</strong> ${(node.parents || []).map(p => p.slice(-8)).join(', ')}
+      </div>
+    `;
+
+    const currentState = this.configSync.getConfig();
+    const targetState = node.state;
+    this.rollbackChanges = this._calculateStateChanges(currentState, targetState);
+
+    if (this.rollbackChanges.length === 0) {
+      this.rollbackChangesList.innerHTML = '<div class="empty-state">当前配置与目标版本一致，无需变更</div>';
+      this.confirmRollbackBtn.disabled = true;
+    } else {
+      let changesHtml = '';
+      this.rollbackChanges.forEach(change => {
+        const typeIcon = change.type === 'set' ? '✏️' : '🗑️';
+        const typeClass = change.type === 'set' ? 'change-set' : 'change-delete';
+        const oldVal = change.oldValue !== undefined ? JSON.stringify(change.oldValue) : 'undefined';
+        const newVal = change.newValue !== undefined ? JSON.stringify(change.newValue) : 'undefined';
+        changesHtml += `
+          <div class="change-item ${typeClass}">
+            <span class="change-icon">${typeIcon}</span>
+            <span class="change-path">${this._escapeHtml(change.path)}</span>
+            <span class="change-arrow">→</span>
+            <span class="change-value">${this._escapeHtml(newVal)}</span>
+            <span class="change-old">(was ${this._escapeHtml(oldVal)})</span>
+          </div>
+        `;
+      });
+      this.rollbackChangesList.innerHTML = changesHtml;
+      this.confirmRollbackBtn.disabled = false;
+    }
+
+    this.rollbackModal.classList.add('show');
+  }
+
+  _hideRollbackModal() {
+    this.rollbackModal.classList.remove('show');
+    this.rollbackTargetNodeId = null;
+    this.rollbackChanges = [];
+  }
+
+  async _confirmRollback() {
+    if (!this.rollbackTargetNodeId || !this.configSync) return;
+
+    if (this.rollbackChanges.length === 0) {
+      this._log('无需回滚，当前配置与目标版本一致', 'info');
+      this._hideRollbackModal();
+      return;
+    }
+
+    const message = this.rollbackMessage.value.trim();
+
+    try {
+      this._log(`⏳ 正在回滚到版本 ${this.rollbackTargetNodeId.slice(-8)}...`, 'info');
+      const result = await this.configSync.rollbackToVersion(this.rollbackTargetNodeId, message);
+
+      if (result.success) {
+        this._log(`✅ 回滚成功，共 ${result.changes.length} 项变更`, 'success');
+        this._hideRollbackModal();
+      } else {
+        this._log('❌ 回滚失败', 'error');
+      }
+    } catch (e) {
+      this._log(`回滚失败: ${e.message}`, 'error');
+    }
+  }
+
+  _calculateStateChanges(currentState, targetState) {
+    const changes = [];
+    const currentPaths = this._getAllPaths(currentState);
+    const targetPaths = this._getAllPaths(targetState);
+
+    const allPaths = new Set([...currentPaths, ...targetPaths]);
+
+    for (const path of allPaths) {
+      const currentValue = this._getByPath(currentState, path);
+      const targetValue = this._getByPath(targetState, path);
+
+      if (currentValue !== targetValue) {
+        if (targetValue === undefined) {
+          changes.push({ type: 'delete', path, oldValue: currentValue, newValue: undefined });
+        } else {
+          changes.push({ type: 'set', path, oldValue: currentValue, newValue: targetValue });
+        }
+      }
+    }
+
+    return changes;
+  }
+
+  _getAllPaths(obj, prefix = '') {
+    const paths = [];
+    if (!obj || typeof obj !== 'object') return paths;
+
+    for (const [key, value] of Object.entries(obj)) {
+      const fullPath = prefix ? `${prefix}.${key}` : key;
+      paths.push(fullPath);
+
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        paths.push(...this._getAllPaths(value, fullPath));
+      }
+    }
+
+    return paths;
+  }
+
+  _getByPath(obj, path) {
+    const parts = path.split('.');
+    let current = obj;
+    for (const part of parts) {
+      if (current === undefined || current === null) return undefined;
+      current = current[part];
+    }
+    return current;
   }
 
   _showDAG() {
@@ -465,14 +764,43 @@ class App {
     keys.forEach(key => {
       const value = config[key];
       const valueStr = JSON.stringify(value);
+      const isEncrypted = this.configSync.isPathEncrypted(key);
+      const hasKey = this.configSync.hasKeyForPath(key);
+      const isLocked = isEncrypted && !hasKey;
+
+      let encryptIcon = '';
+      let encryptTitle = '';
+      if (isEncrypted) {
+        if (hasKey) {
+          encryptIcon = '🔓';
+          encryptTitle = '已加密（已解锁）- 点击移除加密';
+        } else {
+          encryptIcon = '🔒';
+          encryptTitle = '已加密（已锁定）- 点击输入密码解锁';
+        }
+      } else {
+        encryptIcon = '🔐';
+        encryptTitle = '点击设置密码加密';
+      }
+
+      const displayValue = isLocked ? '[已加密，需要密码解锁]' : valueStr;
+      const lockedClass = isLocked ? 'config-locked' : '';
+
       html += `
-        <div class="config-item">
-          <div class="config-key">${this._escapeHtml(key)}</div>
-          <div class="config-value" title="${this._escapeHtml(valueStr)}">${this._escapeHtml(valueStr)}</div>
-          <div class="config-actions-item">
-            <button class="btn btn-sm btn-primary" onclick="app._editConfig('${this._escapeHtml(key)}')">编辑</button>
-            <button class="btn btn-sm btn-danger" onclick="app._deleteConfig('${this._escapeHtml(key)}')">删除</button>
+        <div class="config-item ${lockedClass}">
+          <div class="config-header">
+            <div class="config-key">
+              ${this._escapeHtml(key)}
+              <button class="btn-encrypt" title="${this._escapeHtml(encryptTitle)}" onclick="app._setEncryption('${this._escapeHtml(key)}')">
+                ${encryptIcon}
+              </button>
+            </div>
+            <div class="config-actions-item">
+              <button class="btn btn-sm btn-primary" onclick="app._editConfig('${this._escapeHtml(key)}')" ${isLocked ? 'disabled' : ''}>编辑</button>
+              <button class="btn btn-sm btn-danger" onclick="app._deleteConfig('${this._escapeHtml(key)}')">删除</button>
+            </div>
           </div>
+          <div class="config-value" title="${this._escapeHtml(valueStr)}">${this._escapeHtml(displayValue)}</div>
         </div>
       `;
     });
@@ -482,7 +810,24 @@ class App {
 
   _updateConfigJson() {
     if (this.configSync) {
-      this.configJsonEl.textContent = JSON.stringify(this.configSync.getConfig(), null, 2);
+      const config = this.configSync.getConfig();
+      const encryptedPaths = this.configSync.getEncryptedPaths();
+
+      const displayConfig = { ...config };
+      encryptedPaths.forEach(path => {
+        if (!this.configSync.hasKeyForPath(path)) {
+          const parts = path.split('.');
+          let current = displayConfig;
+          for (let i = 0; i < parts.length - 1; i++) {
+            if (current[parts[i]]) current = current[parts[i]];
+          }
+          if (current && current[parts[parts.length - 1]]) {
+            current[parts[parts.length - 1]] = '[已加密]';
+          }
+        }
+      });
+
+      this.configJsonEl.textContent = JSON.stringify(displayConfig, null, 2);
     }
   }
 
@@ -499,14 +844,32 @@ class App {
     let html = '';
     history.forEach(item => {
       const isHead = item.isHead ? 'head' : '';
+      const typeIcon = {
+        'root': '🌱',
+        'operation': '📝',
+        'merge': '🔀',
+        'batch': '📦',
+        'rollback': '⏪'
+      }[item.type] || '📄';
+
       html += `
         <div class="history-item ${item.type} ${isHead}">
-          <div class="history-message">
-            ${isHead ? '⭐ ' : ''}${this._escapeHtml(item.message)}
+          <div class="history-header">
+            <div class="history-message">
+              ${typeIcon} ${isHead ? '⭐ ' : ''}${this._escapeHtml(item.message)}
+            </div>
+            ${item.type !== 'root' ? `
+              <button class="btn btn-sm btn-warning btn-rollback" 
+                      onclick="app._showRollbackModal('${item.id}')" 
+                      title="回滚到此版本">
+                ⏪
+              </button>
+            ` : ''}
           </div>
           <div class="history-meta">
             ${new Date(item.timestamp).toLocaleString()} | 
             ${item.type.toUpperCase()}
+            ${item.rollbackTo ? ` | 回滚到: ${item.rollbackTo.slice(-8)}` : ''}
           </div>
           ${item.parents && item.parents.length > 0 ? `
             <div class="history-parents">

@@ -7,12 +7,14 @@ class ConfigSync {
     this.crdt = new CRDTMap(nodeId);
     this.history = new DAGHistory();
     this.p2p = new P2PManager(nodeId, roomId, signalingUrl);
+    this.crypto = new CryptoManager();
 
     this.pendingOperations = new Map();
     this.syncedOperations = new Set();
     this.peerVectorClocks = new Map();
     this.isSyncing = false;
     this.syncInProgress = new Set();
+    this.encryptedPathMetadata = new Map();
 
     this.listeners = {
       'config-changed': [],
@@ -25,7 +27,12 @@ class ConfigSync {
       'disconnected': [],
       'history-changed': [],
       'sync-started': [],
-      'sync-complete': []
+      'sync-complete': [],
+      'encryption-required': [],
+      'decryption-error': [],
+      'encryption-enabled': [],
+      'encryption-disabled': [],
+      'rollback-complete': []
     };
 
     this._initHistory(initialConfig);
@@ -127,18 +134,28 @@ class ConfigSync {
     return this.crdt.has(path);
   }
 
-  set(path, value, message = '') {
-    const operation = this.crdt.set(path, value, message);
+  async set(path, value, message = '') {
+    const encryptedValue = await this._maybeEncryptValue(path, value);
+    const operation = this.crdt.set(path, encryptedValue, message);
+
     if (!operation) return null;
+
+    if (this.crypto.isPathEncrypted(path)) {
+      operation.isEncrypted = true;
+      operation.encryptedPath = this.crypto.getEncryptedParentPath(path);
+      operation.originalValue = value;
+    }
 
     this._recordOperation(operation, message);
     this._broadcastOperation(operation);
-    this._emit('config-changed', { path, key: path, value, operation });
+
+    const displayValue = operation.isEncrypted ? value : encryptedValue;
+    this._emit('config-changed', { path, key: path, value: displayValue, operation });
 
     return operation;
   }
 
-  delete(path, message = '') {
+  async delete(path, message = '') {
     const operation = this.crdt.delete(path, message);
     if (!operation) return null;
 
@@ -149,6 +166,130 @@ class ConfigSync {
     return operation;
   }
 
+  async setPasswordForPath(path, password) {
+    try {
+      await this.crypto.setPasswordForPath(path, password);
+
+      this.encryptedPathMetadata.set(path, {
+        enabled: true,
+        timestamp: Date.now(),
+        setBy: this.nodeId
+      });
+
+      const currentValue = this.crdt.get(path);
+      if (currentValue !== undefined) {
+        const encrypted = await this.crypto.encrypt(currentValue, path);
+        this.crdt._setRaw(path, encrypted);
+
+        const metadata = this.crdt.metadata.get(path);
+        if (metadata) {
+          metadata.isEncrypted = true;
+          metadata.encryptedPath = path;
+        }
+      }
+
+      this._emit('encryption-enabled', { path });
+      this._emit('config-changed', { path, encryptionChanged: true, enabled: true });
+
+      return true;
+    } catch (e) {
+      console.error(`Failed to set password for ${path}:`, e);
+      return false;
+    }
+  }
+
+  removePasswordForPath(path) {
+    this.crypto.removePasswordForPath(path);
+    this.encryptedPathMetadata.delete(path);
+
+    this._emit('encryption-disabled', { path });
+    this._emit('config-changed', { path, encryptionChanged: true, enabled: false });
+  }
+
+  async unlockPath(path, password) {
+    try {
+      await this.crypto.setPasswordForPath(path, password);
+
+      this.encryptedPathMetadata.set(path, {
+        enabled: true,
+        timestamp: Date.now(),
+        setBy: this.nodeId,
+        unlocked: true
+      });
+
+      await this._decryptAllEncryptedFields();
+
+      this._emit('encryption-enabled', { path, unlocked: true });
+      this._emit('history-changed', this.history.getHistory());
+
+      return true;
+    } catch (e) {
+      this._emit('decryption-error', { path, error: e.message });
+      return false;
+    }
+  }
+
+  isPathEncrypted(path) {
+    return this.crypto.isPathEncrypted(path);
+  }
+
+  hasKeyForPath(path) {
+    return this.crypto.hasKeyForPath(path);
+  }
+
+  getEncryptedPaths() {
+    return this.crypto.exportEncryptedPaths();
+  }
+
+  async _maybeEncryptValue(path, value) {
+    if (this.crypto.isPathEncrypted(path) && this.crypto.hasKeyForPath(path)) {
+      const encrypted = await this.crypto.encrypt(value, path);
+      return encrypted;
+    }
+    return value;
+  }
+
+  async _decryptAllEncryptedFields() {
+    const encryptedPaths = this.crypto.exportEncryptedPaths();
+    const state = this.crdt.getAll();
+
+    for (const path of encryptedPaths) {
+      if (this.crypto.hasKeyForPath(path)) {
+        try {
+          const value = this.crdt.get(path);
+          if (value && value.encrypted) {
+            const decrypted = await this.crypto.decrypt(value, path);
+            this.crdt._setRaw(path, decrypted);
+          }
+        } catch (e) {
+          console.warn(`Failed to decrypt ${path}:`, e);
+        }
+      }
+    }
+  }
+
+  async _decryptOperationIfNeeded(operation) {
+    if (!operation || !operation.isEncrypted) {
+      return operation;
+    }
+
+    try {
+      const decryptedValue = await this.crypto.decrypt(operation.value, operation.path);
+      return {
+        ...operation,
+        value: decryptedValue,
+        decryptedSuccessfully: true,
+        originalEncryptedValue: operation.value
+      };
+    } catch (e) {
+      return {
+        ...operation,
+        decryptionError: e.message,
+        value: operation.value
+      };
+    }
+  }
+
   _recordOperation(operation, message) {
     const newState = this.crdt.getAll();
     const historyNode = this.history.addOperation(operation, newState, message || operation.message);
@@ -157,10 +298,14 @@ class ConfigSync {
     this._emit('history-changed', this.history.getHistory());
   }
 
-  _broadcastOperation(operation) {
+  async _broadcastOperation(operation) {
+    const opToSend = operation.isEncrypted && operation.originalValue
+      ? { ...operation, value: operation.value, originalValue: undefined }
+      : operation;
+
     const message = {
       type: 'operation',
-      operation,
+      operation: opToSend,
       historyNodeId: this.history.currentHead,
       vectorClock: this.crdt.getVectorClock()
     };
@@ -204,7 +349,7 @@ class ConfigSync {
     }
   }
 
-  _sendIncrementalSync(peerId, operations, baseVectorClock) {
+  async _sendIncrementalSync(peerId, operations, baseVectorClock) {
     if (operations.length === 0) {
       console.log(`[ConfigSync] No incremental updates needed for ${peerId}`);
       this._sendFullStateIfNeeded(peerId);
@@ -258,25 +403,26 @@ class ConfigSync {
       crdtState: this.crdt.exportState(),
       history: this.history.export(),
       fromNodeId: this.nodeId,
-      vectorClock: this.crdt.getVectorClock()
+      vectorClock: this.crdt.getVectorClock(),
+      encryptedPaths: this.crypto.exportEncryptedPaths()
     };
 
     this.p2p.sendToPeer(peerId, state);
   }
 
-  _handleMessage(peerId, data) {
+  async _handleMessage(peerId, data) {
     switch (data.type) {
       case 'operation':
-        this._handleOperation(peerId, data);
+        await this._handleOperation(peerId, data);
         break;
       case 'sync-request':
         this._handleSyncRequest(peerId, data);
         break;
       case 'sync-response':
-        this._handleSyncResponse(peerId, data);
+        await this._handleSyncResponse(peerId, data);
         break;
       case 'state-sync':
-        this._handleStateSync(peerId, data);
+        await this._handleStateSync(peerId, data);
         break;
       case 'operation-request':
         this._handleOperationRequest(peerId, data);
@@ -284,12 +430,15 @@ class ConfigSync {
       case 'history-request':
         this._handleHistoryRequest(peerId, data);
         break;
+      case 'rollback':
+        await this._handleRollback(peerId, data);
+        break;
       default:
         console.log('Unknown message type:', data.type);
     }
   }
 
-  _handleOperation(peerId, data) {
+  async _handleOperation(peerId, data) {
     const { operation, historyNodeId, vectorClock } = data;
 
     if (!operation || !operation.id) {
@@ -301,7 +450,9 @@ class ConfigSync {
       return;
     }
 
-    const result = this.crdt.applyRemote(operation);
+    const decryptedOp = await this._decryptOperationIfNeeded(operation);
+
+    const result = this.crdt.applyRemote(decryptedOp);
 
     if (result.applied) {
       this.syncedOperations.add(operation.id);
@@ -311,38 +462,56 @@ class ConfigSync {
       }
 
       const newState = this.crdt.getAll();
-      const historyNode = this.history.addOperation(operation, newState, operation.message);
+      const historyNode = this.history.addOperation(decryptedOp, newState, decryptedOp.message);
+
+      const displayValue = decryptedOp.decryptedSuccessfully
+        ? decryptedOp.value
+        : (decryptedOp.type === 'delete' ? undefined : decryptedOp.value);
 
       this._emit('config-changed', {
-        path: operation.path || operation.key,
-        key: operation.key,
-        value: operation.type === 'delete' ? undefined : operation.value,
-        operation,
+        path: decryptedOp.path || decryptedOp.key,
+        key: decryptedOp.key,
+        value: displayValue,
+        operation: decryptedOp,
         remote: true,
         from: peerId,
-        conflict: result.conflict
+        conflict: result.conflict,
+        decryptionError: decryptedOp.decryptionError
       });
 
       this._emit('operation-applied', {
-        operation,
+        operation: decryptedOp,
         historyNode,
         local: false,
         from: peerId,
-        conflict: result.conflict
+        conflict: result.conflict,
+        decryptionError: decryptedOp.decryptionError
       });
+
+      if (decryptedOp.decryptionError) {
+        this._emit('decryption-error', {
+          path: decryptedOp.path,
+          error: decryptedOp.decryptionError,
+          from: peerId
+        });
+      }
 
       this._emit('history-changed', this.history.getHistory());
 
-      this._gossipOperation(operation, historyNode.id, peerId);
+      this._gossipOperation(decryptedOp, historyNode.id, peerId);
     } else if (result.conflict) {
       console.log(`[ConfigSync] Operation conflict, already have newer version of ${operation.key}`);
     }
   }
 
   _gossipOperation(operation, historyNodeId, excludePeerId) {
+    const opToSend = operation.decryptedSuccessfully
+      ? { ...operation, value: operation.originalEncryptedValue }
+      : operation;
+
     const message = {
       type: 'operation',
-      operation,
+      operation: opToSend,
       historyNodeId,
       vectorClock: this.crdt.getVectorClock()
     };
@@ -374,7 +543,7 @@ class ConfigSync {
     }
   }
 
-  _handleSyncResponse(peerId, data) {
+  async _handleSyncResponse(peerId, data) {
     console.log(`[ConfigSync] Received sync response from ${peerId}`);
 
     const { operations, baseVectorClock, currentVectorClock, incremental } = data;
@@ -382,7 +551,13 @@ class ConfigSync {
     if (incremental && operations && operations.length > 0) {
       console.log(`[ConfigSync] Applying ${operations.length} incremental operations from ${peerId}`);
 
-      const appliedOps = this.crdt.applyOperations(operations);
+      const decryptedOps = [];
+      for (const op of operations) {
+        const decrypted = await this._decryptOperationIfNeeded(op);
+        decryptedOps.push(decrypted);
+      }
+
+      const appliedOps = this.crdt.applyOperations(decryptedOps);
 
       if (appliedOps.length > 0) {
         const newState = this.crdt.getAll();
@@ -419,34 +594,44 @@ class ConfigSync {
     }
   }
 
-  _handleStateSync(peerId, data) {
+  async _handleStateSync(peerId, data) {
     console.log(`[ConfigSync] Received state sync from ${peerId}`);
 
     if (data.fromNodeId === this.nodeId) return;
 
-    const { crdtState, history, vectorClock } = data;
+    const { crdtState, history, vectorClock, encryptedPaths } = data;
+
+    if (encryptedPaths && encryptedPaths.length > 0) {
+      this.crypto.importEncryptedPaths(encryptedPaths);
+    }
 
     const tempCrdt = new CRDTMap(data.fromNodeId);
     tempCrdt.importState(crdtState);
 
     const mergedOps = this.crdt.merge(tempCrdt);
 
-    if (mergedOps.length > 0) {
+    const decryptedMergedOps = [];
+    for (const op of mergedOps) {
+      const decrypted = await this._decryptOperationIfNeeded(op);
+      decryptedMergedOps.push(decrypted);
+    }
+
+    if (decryptedMergedOps.length > 0) {
       const newState = this.crdt.getAll();
 
-      if (mergedOps.length === 1) {
-        this.history.addOperation(mergedOps[0], newState, mergedOps[0].message || 'Remote update');
+      if (decryptedMergedOps.length === 1) {
+        this.history.addOperation(decryptedMergedOps[0], newState, decryptedMergedOps[0].message || 'Remote update');
       } else {
-        this.history.mergeOperations(mergedOps, newState, `Merged state from ${peerId}`);
+        this.history.mergeOperations(decryptedMergedOps, newState, `Merged state from ${peerId}`);
       }
 
-      mergedOps.forEach(op => {
+      decryptedMergedOps.forEach(op => {
         this.syncedOperations.add(op.id);
       });
 
       this._emit('config-changed', {
         merged: true,
-        operations: mergedOps,
+        operations: decryptedMergedOps,
         from: peerId
       });
 
@@ -467,7 +652,7 @@ class ConfigSync {
 
     this.syncInProgress.delete(peerId);
     this._emit('connected', { peerId, synced: true });
-    this._emit('sync-complete', { peerId, incremental: false, operationCount: mergedOps.length });
+    this._emit('sync-complete', { peerId, incremental: false, operationCount: decryptedMergedOps.length });
   }
 
   _mergeHistory(remoteHistory) {
@@ -507,8 +692,228 @@ class ConfigSync {
       crdtState: this.crdt.exportState(),
       history: this.history.export(),
       fromNodeId: this.nodeId,
-      vectorClock: this.crdt.getVectorClock()
+      vectorClock: this.crdt.getVectorClock(),
+      encryptedPaths: this.crypto.exportEncryptedPaths()
     });
+  }
+
+  async rollbackToVersion(historyNodeId, message = '') {
+    const targetNode = this.history.getNode(historyNodeId);
+    if (!targetNode) {
+      throw new Error(`History node not found: ${historyNodeId}`);
+    }
+
+    const targetState = targetNode.state;
+    const currentState = this.crdt.getAll();
+
+    const changes = this._calculateStateChanges(currentState, targetState);
+
+    if (changes.length === 0) {
+      console.log('[ConfigSync] No changes needed for rollback');
+      return { success: true, changes: [] };
+    }
+
+    const rollbackOperations = [];
+    for (const change of changes) {
+      let op;
+      if (change.type === 'set') {
+        op = this.crdt.set(change.path, change.newValue, `Rollback: set ${change.path}`);
+      } else if (change.type === 'delete') {
+        op = this.crdt.delete(change.path, `Rollback: delete ${change.path}`);
+      }
+
+      if (op) {
+        op.isRollback = true;
+        op.rollbackFrom = this.history.currentHead;
+        op.rollbackTo = historyNodeId;
+        rollbackOperations.push(op);
+      }
+    }
+
+    if (rollbackOperations.length > 0) {
+      const newState = this.crdt.getAll();
+
+      const rollbackNode = {
+        id: this.history._generateId('rollback'),
+        type: 'rollback',
+        operations: rollbackOperations,
+        state: JSON.parse(JSON.stringify(newState)),
+        parents: [this.history.currentHead, historyNodeId],
+        timestamp: Date.now(),
+        message: message || `Rollback to version ${historyNodeId.slice(-8)}`,
+        rollbackFrom: this.history.currentHead,
+        rollbackTo: historyNodeId
+      };
+
+      this.history.nodes.set(rollbackNode.id, rollbackNode);
+      this.history.edges.set(rollbackNode.id, []);
+
+      rollbackNode.parents.forEach(parentId => {
+        const parentEdges = this.history.edges.get(parentId) || [];
+        parentEdges.push(rollbackNode.id);
+        this.history.edges.set(parentId, parentEdges);
+      });
+
+      this.history.currentHead = rollbackNode.id;
+      this.history.undoStack.push(rollbackNode.id);
+      this.history.redoStack = [];
+
+      rollbackOperations.forEach(op => {
+        this.syncedOperations.add(op.id);
+        this._broadcastOperation(op);
+      });
+
+      this.p2p.broadcast({
+        type: 'rollback',
+        rollbackNodeId: rollbackNode.id,
+        targetNodeId: historyNodeId,
+        operations: rollbackOperations,
+        fromNodeId: this.nodeId
+      });
+
+      this._emit('config-changed', {
+        rollback: true,
+        rollbackNodeId: rollbackNode.id,
+        targetNodeId: historyNodeId,
+        operations: rollbackOperations,
+        changes
+      });
+
+      this._emit('rollback-complete', {
+        rollbackNodeId: rollbackNode.id,
+        targetNodeId: historyNodeId,
+        changes
+      });
+
+      this._emit('history-changed', this.history.getHistory());
+
+      return { success: true, changes, rollbackNode };
+    }
+
+    return { success: true, changes: [] };
+  }
+
+  async _handleRollback(peerId, data) {
+    const { rollbackNodeId, targetNodeId, operations, fromNodeId } = data;
+
+    if (fromNodeId === this.nodeId) return;
+
+    console.log(`[ConfigSync] Received rollback from ${peerId}: ${rollbackNodeId}`);
+
+    const appliedOps = [];
+    for (const op of operations) {
+      if (!this.syncedOperations.has(op.id)) {
+        const decryptedOp = await this._decryptOperationIfNeeded(op);
+        const result = this.crdt.applyRemote(decryptedOp);
+
+        if (result.applied) {
+          this.syncedOperations.add(op.id);
+          appliedOps.push(decryptedOp);
+        }
+      }
+    }
+
+    if (appliedOps.length > 0) {
+      const newState = this.crdt.getAll();
+      const targetNode = this.history.getNode(targetNodeId);
+
+      const rollbackNode = {
+        id: rollbackNodeId,
+        type: 'rollback',
+        operations: appliedOps,
+        state: JSON.parse(JSON.stringify(newState)),
+        parents: [this.history.currentHead, targetNodeId],
+        timestamp: Date.now(),
+        message: `Rollback from ${peerId}`,
+        rollbackFrom: this.history.currentHead,
+        rollbackTo: targetNodeId
+      };
+
+      if (!this.history.nodes.has(rollbackNodeId)) {
+        this.history.nodes.set(rollbackNodeId, rollbackNode);
+        this.history.edges.set(rollbackNodeId, []);
+
+        rollbackNode.parents.forEach(parentId => {
+          if (this.history.nodes.has(parentId)) {
+            const parentEdges = this.history.edges.get(parentId) || [];
+            parentEdges.push(rollbackNodeId);
+            this.history.edges.set(parentId, parentEdges);
+          }
+        });
+      }
+
+      this.history.currentHead = rollbackNodeId;
+      this.history.undoStack.push(rollbackNodeId);
+      this.history.redoStack = [];
+
+      this._emit('config-changed', {
+        rollback: true,
+        remote: true,
+        from: peerId,
+        rollbackNodeId,
+        targetNodeId,
+        operations: appliedOps
+      });
+
+      this._emit('rollback-complete', {
+        rollbackNodeId,
+        targetNodeId,
+        remote: true,
+        from: peerId,
+        changes: appliedOps
+      });
+
+      this._emit('history-changed', this.history.getHistory());
+    }
+  }
+
+  _calculateStateChanges(currentState, targetState) {
+    const changes = [];
+    const currentPaths = this._getAllPaths(currentState);
+    const targetPaths = this._getAllPaths(targetState);
+
+    const allPaths = new Set([...currentPaths, ...targetPaths]);
+
+    for (const path of allPaths) {
+      const currentValue = this._getByPath(currentState, path);
+      const targetValue = this._getByPath(targetState, path);
+
+      if (currentValue !== targetValue) {
+        if (targetValue === undefined) {
+          changes.push({ type: 'delete', path, oldValue: currentValue, newValue: undefined });
+        } else {
+          changes.push({ type: 'set', path, oldValue: currentValue, newValue: targetValue });
+        }
+      }
+    }
+
+    return changes;
+  }
+
+  _getAllPaths(obj, prefix = '') {
+    const paths = [];
+    if (!obj || typeof obj !== 'object') return paths;
+
+    for (const [key, value] of Object.entries(obj)) {
+      const fullPath = prefix ? `${prefix}.${key}` : key;
+      paths.push(fullPath);
+
+      if (value && typeof value === 'object' && !Array.isArray(value)) {
+        paths.push(...this._getAllPaths(value, fullPath));
+      }
+    }
+
+    return paths;
+  }
+
+  _getByPath(obj, path) {
+    const parts = path.split('.');
+    let current = obj;
+    for (const part of parts) {
+      if (current === undefined || current === null) return undefined;
+      current = current[part];
+    }
+    return current;
   }
 
   undo() {
@@ -615,6 +1020,14 @@ class ConfigSync {
       peerVCs[peerId] = vc;
     });
 
+    const encryptedPaths = {};
+    this.crypto.exportEncryptedPaths().forEach(path => {
+      encryptedPaths[path] = {
+        hasKey: this.crypto.hasKeyForPath(path),
+        ...this.encryptedPathMetadata.get(path)
+      };
+    });
+
     return {
       nodeId: this.nodeId,
       roomId: this.roomId,
@@ -626,6 +1039,7 @@ class ConfigSync {
       vectorClock: this.crdt.getVectorClock(),
       peerVectorClocks: peerVCs,
       syncInProgress: Array.from(this.syncInProgress),
+      encryptedPaths,
       ...this.p2p.getStatus()
     };
   }
@@ -650,12 +1064,18 @@ class ConfigSync {
     }
   }
 
-  batchSet(entries, message = 'Batch update') {
+  async batchSet(entries, message = 'Batch update') {
     const operations = [];
 
     for (const [key, value] of entries) {
-      const op = this.crdt.set(key, value, message);
+      const encryptedValue = await this._maybeEncryptValue(key, value);
+      const op = this.crdt.set(key, encryptedValue, message);
       if (op) {
+        if (this.crypto.isPathEncrypted(key)) {
+          op.isEncrypted = true;
+          op.encryptedPath = this.crypto.getEncryptedParentPath(key);
+          op.originalValue = value;
+        }
         operations.push(op);
       }
     }
@@ -690,9 +1110,13 @@ class ConfigSync {
 
       operations.forEach(op => {
         this.syncedOperations.add(op.id);
+        const opToSend = op.originalValue
+          ? { ...op, value: op.value, originalValue: undefined }
+          : op;
+
         this.p2p.broadcast({
           type: 'operation',
-          operation: op,
+          operation: opToSend,
           historyNodeId: node.id,
           vectorClock: this.crdt.getVectorClock()
         });

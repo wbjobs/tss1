@@ -586,6 +586,147 @@ body {
   }
 }
 
+.btn-encrypt {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 16px;
+  padding: 2px 6px;
+  margin-left: 6px;
+  border-radius: 4px;
+  transition: all 0.2s;
+}
+
+.btn-encrypt:hover {
+  background: rgba(102, 126, 234, 0.1);
+  transform: scale(1.1);
+}
+
+.config-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.config-locked {
+  opacity: 0.7;
+  background: #fff3cd !important;
+  border-left: 4px solid #ffc107 !important;
+}
+
+.config-locked .config-value {
+  color: #856404;
+  font-style: italic;
+}
+
+.btn-rollback {
+  padding: 4px 8px !important;
+  font-size: 12px !important;
+  opacity: 0.7;
+  transition: opacity 0.2s;
+}
+
+.btn-rollback:hover {
+  opacity: 1;
+}
+
+.history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.dag-node.rollback {
+  border-color: #fd7e14;
+  background: #ffeaa7;
+}
+
+.rollback-info {
+  background: #f8f9fa;
+  padding: 12px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+
+.rollback-info-item {
+  margin-bottom: 4px;
+}
+
+.rollback-info-item:last-child {
+  margin-bottom: 0;
+}
+
+.rollback-changes h4 {
+  margin-bottom: 8px;
+  color: #555;
+  font-size: 13px;
+}
+
+.changes-list {
+  background: #f8f9fa;
+  padding: 12px;
+  border-radius: 6px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.change-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  margin-bottom: 4px;
+  border-radius: 4px;
+  font-size: 12px;
+  font-family: 'Courier New', monospace;
+}
+
+.change-item:last-child {
+  margin-bottom: 0;
+}
+
+.change-item.change-set {
+  background: #d4edda;
+  color: #155724;
+}
+
+.change-item.change-delete {
+  background: #f8d7da;
+  color: #721c24;
+}
+
+.change-icon {
+  font-size: 14px;
+}
+
+.change-path {
+  font-weight: 600;
+}
+
+.change-arrow {
+  opacity: 0.6;
+}
+
+.change-old {
+  opacity: 0.5;
+  font-size: 11px;
+  text-decoration: line-through;
+}
+
+.history-item.rollback {
+  border-left: 4px solid #fd7e14;
+  background: #fff9f0;
+}
+
+.error-message {
+  font-size: 13px;
+  padding: 8px 12px;
+  background: #f8d7da;
+  border-radius: 4px;
+}
+
 @media (max-width: 600px) {
   .connection-info {
     flex-direction: column;

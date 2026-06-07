@@ -248,6 +248,28 @@ class CRDTMap {
     return operation;
   }
 
+  _setRaw(path, value) {
+    const pathKey = this._getPathKey(path);
+    const parts = this._parsePath(path);
+
+    this._setByPath(this.root, parts, value);
+
+    const metadata = this.metadata.get(pathKey);
+    if (metadata) {
+      metadata.lastUpdate = Date.now();
+    }
+
+    this.deletedPaths.delete(pathKey);
+  }
+
+  getMetadataMap() {
+    const result = {};
+    for (const [key, value] of this.metadata.entries()) {
+      result[key] = value;
+    }
+    return result;
+  }
+
   delete(path, message = '') {
     const result = this._getObjectByPath(this.root, path);
     if (!result.exists) return null;

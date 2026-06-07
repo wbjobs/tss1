@@ -157,6 +157,56 @@
     </div>
   </div>
 
+  <div id="passwordModal" class="modal">
+    <div class="modal-content">
+      <h3 id="passwordModalTitle">🔐 输入加密密码</h3>
+      <div class="form-group">
+        <label id="passwordPathLabel">配置路径</label>
+        <input type="text" id="passwordPath" readonly>
+      </div>
+      <div class="form-group">
+        <label>密码</label>
+        <input type="password" id="passwordInput" placeholder="请输入密码">
+      </div>
+      <div class="form-group">
+        <label>确认密码 <span id="confirmPasswordHint" style="color: #999;">(设置新密码时需要)</span></label>
+        <input type="password" id="confirmPasswordInput" placeholder="再次输入密码">
+      </div>
+      <div id="passwordError" class="error-message" style="display: none; color: #dc3545; margin-bottom: 12px;"></div>
+      <div class="modal-actions">
+        <button id="cancelPasswordBtn" class="btn btn-secondary">取消</button>
+        <button id="confirmPasswordBtn" class="btn btn-primary">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="rollbackModal" class="modal">
+    <div class="modal-content">
+      <h3>⏪ 确认版本回滚</h3>
+      <div class="form-group">
+        <label>目标版本</label>
+        <input type="text" id="rollbackTargetId" readonly>
+      </div>
+      <div class="form-group">
+        <label>版本信息</label>
+        <div id="rollbackTargetInfo" class="rollback-info"></div>
+      </div>
+      <div class="form-group">
+        <label>回滚说明 (可选)</label>
+        <input type="text" id="rollbackMessage" placeholder="例如: 修复错误配置">
+      </div>
+      <div id="rollbackChanges" class="rollback-changes" style="margin-bottom: 12px;">
+        <h4>预计变更:</h4>
+        <div id="rollbackChangesList" class="changes-list"></div>
+      </div>
+      <div class="modal-actions">
+        <button id="cancelRollbackBtn" class="btn btn-secondary">取消</button>
+        <button id="confirmRollbackBtn" class="btn btn-warning">⚠️ 确认回滚</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/crypto.js"></script>
   <script src="js/crdt.js"></script>
   <script src="js/dag-history.js"></script>
   <script src="js/p2p-manager.js"></script>

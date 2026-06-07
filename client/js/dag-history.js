@@ -81,6 +81,40 @@ class DAGHistory {
     return node;
   }
 
+  rollback(targetNodeId, operations, newState, message = '') {
+    const targetNode = this.nodes.get(targetNodeId);
+    if (!targetNode) {
+      throw new Error(`Target node not found: ${targetNodeId}`);
+    }
+
+    const rollbackNode = {
+      id: this._generateId('rollback'),
+      type: 'rollback',
+      operations,
+      state: JSON.parse(JSON.stringify(newState)),
+      parents: [this.currentHead, targetNodeId],
+      timestamp: Date.now(),
+      message: message || `Rollback to ${targetNodeId.slice(-8)}`,
+      rollbackFrom: this.currentHead,
+      rollbackTo: targetNodeId
+    };
+
+    this.nodes.set(rollbackNode.id, rollbackNode);
+    this.edges.set(rollbackNode.id, []);
+
+    rollbackNode.parents.forEach(parentId => {
+      const parentEdges = this.edges.get(parentId) || [];
+      parentEdges.push(rollbackNode.id);
+      this.edges.set(parentId, parentEdges);
+    });
+
+    this.currentHead = rollbackNode.id;
+    this.undoStack.push(rollbackNode.id);
+    this.redoStack = [];
+
+    return rollbackNode;
+  }
+
   undo() {
     if (this.undoStack.length === 0) return null;
 
