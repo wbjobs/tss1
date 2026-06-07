@@ -1,0 +1,16 @@
+{
+  "name": "webrtc-p2p-config-sync",
+  "version": "1.0.0",
+  "description": "P2P configuration synchronization system using WebRTC DataChannel and CRDT",
+  "main": "server/signaling.js",
+  "scripts": {
+    "start": "node server/signaling.js",
+    "dev": "node server/signaling.js"
+  },
+  "keywords": ["webrtc", "p2p", "crdt", "datachannel", "config-sync"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}

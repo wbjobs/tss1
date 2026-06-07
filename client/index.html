@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>P2P 配置同步系统 - WebRTC DataChannel</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div class="container">
+    <header class="header">
+      <h1>🌐 P2P 配置同步系统</h1>
+      <div class="subtitle">基于 WebRTC DataChannel + CRDT 的分布式配置管理</div>
+      <div class="connection-info">
+        <div class="info-item">
+          <span class="label">节点ID:</span>
+          <span id="nodeId" class="value">--</span>
+        </div>
+        <div class="info-item">
+          <span class="label">房间ID:</span>
+          <span id="roomId" class="value">--</span>
+        </div>
+        <div class="info-item">
+          <span class="label">连接状态:</span>
+          <span id="connectionStatus" class="status-badge status-disconnected">未连接</span>
+        </div>
+        <div class="info-item">
+          <span class="label">在线节点:</span>
+          <span id="peerCount" class="value">0</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="main-content">
+      <div class="left-panel">
+        <div class="card">
+          <h2>连接设置</h2>
+          <div class="form-group">
+            <label>房间ID</label>
+            <input type="text" id="roomInput" placeholder="输入房间ID，如: default-room" value="default-room">
+          </div>
+          <div class="form-group">
+            <label>信令服务器</label>
+            <input type="text" id="signalingInput" placeholder="ws://localhost:8080" value="ws://localhost:8080">
+          </div>
+          <button id="connectBtn" class="btn btn-primary">🔗 连接</button>
+          <button id="disconnectBtn" class="btn btn-danger" disabled>⛔ 断开连接</button>
+        </div>
+
+        <div class="card">
+          <h2>⚙️ 配置编辑器</h2>
+          <div class="config-actions">
+            <button id="addBtn" class="btn btn-success">➕ 添加配置项</button>
+            <button id="undoBtn" class="btn btn-secondary" disabled>↶ 撤销</button>
+            <button id="redoBtn" class="btn btn-secondary" disabled>↷ 重做</button>
+            <button id="exportBtn" class="btn btn-secondary">📤 导出</button>
+            <button id="importBtn" class="btn btn-secondary">📥 导入</button>
+          </div>
+          <div id="configEditor" class="config-editor">
+            <div class="empty-state">暂无配置项，点击"添加配置项"开始</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>📄 当前配置 (JSON)</h2>
+          <pre id="configJson" class="json-display">{}</pre>
+        </div>
+      </div>
+
+      <div class="right-panel">
+        <div class="card">
+          <h2>🔌 在线节点列表</h2>
+          <div id="peersList" class="peers-list">
+            <div class="empty-state">暂无连接的节点</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>📜 变更历史 (DAG)</h2>
+          <div class="history-actions">
+            <button id="refreshHistoryBtn" class="btn btn-sm btn-secondary">🔄 刷新</button>
+            <button id="showDAGBtn" class="btn btn-sm btn-secondary">🌲 查看DAG结构</button>
+          </div>
+          <div id="historyList" class="history-list">
+            <div class="empty-state">暂无变更历史</div>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>📊 系统状态</h2>
+          <pre id="statusDisplay" class="status-display">{}</pre>
+        </div>
+
+        <div class="card">
+          <h2>📝 操作日志</h2>
+          <div id="logPanel" class="log-panel"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="addConfigModal" class="modal">
+    <div class="modal-content">
+      <h3>添加/修改配置项</h3>
+      <div class="form-group">
+        <label>键 (Key)</label>
+        <input type="text" id="configKeyInput" placeholder="例如: app.title">
+      </div>
+      <div class="form-group">
+        <label>值 (Value) - JSON格式</label>
+        <textarea id="configValueInput" rows="4" placeholder='例如: "Hello World" 或 123 或 {"nested": true}'></textarea>
+      </div>
+      <div class="form-group">
+        <label>描述 (可选)</label>
+        <input type="text" id="configMsgInput" placeholder="变更描述">
+      </div>
+      <div class="modal-actions">
+        <button id="cancelAddBtn" class="btn btn-secondary">取消</button>
+        <button id="confirmAddBtn" class="btn btn-primary">确认</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="dagModal" class="modal">
+    <div class="modal-content modal-large">
+      <h3>🌲 DAG 有向无环图结构</h3>
+      <div id="dagDisplay" class="dag-display"></div>
+      <div class="modal-actions">
+        <button id="closeDAGBtn" class="btn btn-secondary">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="importModal" class="modal">
+    <div class="modal-content modal-large">
+      <h3>📥 导入配置 (JSON)</h3>
+      <div class="form-group">
+        <label>粘贴JSON配置</label>
+        <textarea id="importTextarea" rows="10" placeholder='{"key1": "value1", "key2": 123}'></textarea>
+      </div>
+      <div class="modal-actions">
+        <button id="cancelImportBtn" class="btn btn-secondary">取消</button>
+        <button id="confirmImportBtn" class="btn btn-primary">导入</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/crdt.js"></script>
+  <script src="js/dag-history.js"></script>
+  <script src="js/p2p-manager.js"></script>
+  <script src="js/config-sync.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
