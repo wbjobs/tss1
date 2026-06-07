@@ -6,18 +6,27 @@ class P2PManager {
     this.peers = new Map();
     this.peerConnections = new Map();
     this.dataChannels = new Map();
+    this.peerReconnectAttempts = new Map();
+    this.peerIceGatheringStates = new Map();
+    this.messageQueue = new Map();
+    this.peerVectorClocks = new Map();
     this.ws = null;
     this.reconnectAttempts = 0;
     this.maxReconnectAttempts = 5;
+    this.maxPeerReconnectAttempts = 8;
     this.isConnected = false;
 
     this.listeners = {
       'peer-connected': [],
       'peer-disconnected': [],
+      'peer-reconnecting': [],
+      'peer-reconnected': [],
       'message': [],
       'connected': [],
       'disconnected': [],
-      'state-change': []
+      'state-change': [],
+      'ice-failed': [],
+      'vector-clock-update': []
     };
 
     this.iceServers = [
@@ -27,6 +36,9 @@ class P2PManager {
       { urls: 'stun:stun3.l.google.com:19302' },
       { urls: 'stun:stun4.l.google.com:19302' }
     ];
+
+    this.iceGatheringTimeout = 10000;
+    this.peerReconnectDelay = 2000;
   }
 
   on(event, callback) {
@@ -143,25 +155,55 @@ class P2PManager {
     this._emit('peer-disconnected', { peerId });
   }
 
-  async _initiateConnection(peerId, isInitiator) {
-    console.log(`[P2P] ${isInitiator ? 'Initiating' : 'Accepting'} connection with ${peerId}`);
+  async _initiateConnection(peerId, isInitiator, isReconnect = false) {
+    console.log(`[P2P] ${isReconnect ? 'Reconnecting' : isInitiator ? 'Initiating' : 'Accepting'} connection with ${peerId}`);
 
-    if (this.peerConnections.has(peerId)) {
-      console.log(`[P2P] Already connected to ${peerId}`);
-      return;
+    if (this.peerConnections.has(peerId) && !isReconnect) {
+      const pc = this.peerConnections.get(peerId);
+      if (pc.connectionState === 'connected' || pc.connectionState === 'connecting') {
+        console.log(`[P2P] Already connected/connecting to ${peerId}`);
+        return;
+      }
+      this._cleanupPeer(peerId, false);
     }
 
-    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    this.peerConnections.set(peerId, pc);
-
-    const dc = pc.createDataChannel('config-sync', {
-      ordered: true,
-      reliable: true
+    const pc = new RTCPeerConnection({
+      iceServers: this.iceServers,
+      iceTransportPolicy: 'all',
+      bundlePolicy: 'max-bundle'
     });
 
-    this._setupDataChannel(dc, peerId);
+    this.peerConnections.set(peerId, pc);
+    this.peerIceGatheringStates.set(peerId, 'gathering');
+
+    const iceTimeout = setTimeout(() => {
+      const state = this.peerIceGatheringStates.get(peerId);
+      if (state === 'gathering') {
+        console.log(`[P2P] ICE gathering timeout for ${peerId}, completing anyway`);
+        if (pc.iceGatheringState !== 'complete') {
+          this._sendSignaling({
+            type: pc.localDescription?.type === 'offer' ? 'offer' : 'answer',
+            from: this.nodeId,
+            targetId: peerId,
+            roomId: this.roomId,
+            payload: pc.localDescription
+          });
+        }
+        this.peerIceGatheringStates.set(peerId, 'complete');
+      }
+    }, this.iceGatheringTimeout);
+
+    if (isInitiator) {
+      const dc = pc.createDataChannel('config-sync', {
+        ordered: true,
+        reliable: true,
+        protocol: 'json'
+      });
+      this._setupDataChannel(dc, peerId);
+    }
 
     pc.onicecandidate = (event) => {
+      console.log(`[P2P] ICE candidate for ${peerId}:`, event.candidate?.candidate || '(end of candidates)');
       if (event.candidate) {
         this._sendSignaling({
           type: 'ice-candidate',
@@ -170,6 +212,34 @@ class P2PManager {
           roomId: this.roomId,
           payload: event.candidate
         });
+      } else {
+        console.log(`[P2P] ICE gathering complete for ${peerId}`);
+        clearTimeout(iceTimeout);
+        this.peerIceGatheringStates.set(peerId, 'complete');
+      }
+    };
+
+    pc.onicegatheringstatechange = () => {
+      console.log(`[P2P] ICE gathering state for ${peerId}: ${pc.iceGatheringState}`);
+      if (pc.iceGatheringState === 'complete') {
+        clearTimeout(iceTimeout);
+        this.peerIceGatheringStates.set(peerId, 'complete');
+      }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      console.log(`[P2P] ICE connection state for ${peerId}: ${pc.iceConnectionState}`);
+
+      if (pc.iceConnectionState === 'failed') {
+        console.error(`[P2P] ICE connection failed for ${peerId}`);
+        clearTimeout(iceTimeout);
+        this._emit('ice-failed', { peerId, state: pc.iceConnectionState });
+        this._handlePeerConnectionFailed(peerId, pc);
+      } else if (pc.iceConnectionState === 'disconnected') {
+        console.warn(`[P2P] ICE connection disconnected for ${peerId}, attempting to restart ICE`);
+        this._attemptIceRestart(peerId, pc);
+      } else if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+        this.peerReconnectAttempts.set(peerId, 0);
       }
     };
 
@@ -179,8 +249,17 @@ class P2PManager {
 
       if (pc.connectionState === 'connected') {
         this.peers.set(peerId, true);
+        this.peerReconnectAttempts.set(peerId, 0);
+        this._flushMessageQueue(peerId);
+
+        if (isReconnect) {
+          this._emit('peer-reconnected', { peerId });
+        }
+
+        this._requestSyncFromPeer(peerId);
       } else if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        this._cleanupPeer(peerId);
+        this.peers.delete(peerId);
+        this._handlePeerConnectionFailed(peerId, pc);
       }
     };
 
@@ -189,9 +268,17 @@ class P2PManager {
       this._setupDataChannel(event.channel, peerId);
     };
 
+    pc.onsignalingstatechange = () => {
+      console.log(`[P2P] Signaling state for ${peerId}: ${pc.signalingState}`);
+    };
+
     if (isInitiator) {
       try {
-        const offer = await pc.createOffer();
+        const offer = await pc.createOffer({
+          offerToReceiveAudio: false,
+          offerToReceiveVideo: false,
+          iceRestart: isReconnect
+        });
         await pc.setLocalDescription(offer);
         this._sendSignaling({
           type: 'offer',
@@ -203,6 +290,7 @@ class P2PManager {
       } catch (err) {
         console.error('[P2P] Error creating offer:', err);
         this._cleanupPeer(peerId);
+        this._schedulePeerReconnect(peerId);
       }
     }
   }
@@ -210,14 +298,23 @@ class P2PManager {
   async _handleOffer(from, offer) {
     console.log(`[P2P] Received offer from ${from}`);
 
-    if (!this.peerConnections.has(from)) {
+    let pc = this.peerConnections.get(from);
+    if (!pc || pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      if (pc) {
+        this._cleanupPeer(from, false);
+      }
       await this._initiateConnection(from, false);
+      pc = this.peerConnections.get(from);
     }
 
-    const pc = this.peerConnections.get(from);
     if (!pc) return;
 
     try {
+      if (pc.signalingState !== 'stable' && pc.signalingState !== 'have-local-offer') {
+        console.log(`[P2P] Unexpected signaling state: ${pc.signalingState}, rolling back`);
+        await pc.setRemoteDescription(new RTCSessionDescription({ type: 'rollback' }));
+      }
+
       await pc.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -230,6 +327,11 @@ class P2PManager {
       });
     } catch (err) {
       console.error('[P2P] Error handling offer:', err);
+      if (err.name === 'InvalidModificationError') {
+        console.log('[P2P] Attempting to recreate peer connection');
+        this._cleanupPeer(from, false);
+        setTimeout(() => this._initiateConnection(from, false), 1000);
+      }
     }
   }
 
@@ -239,7 +341,11 @@ class P2PManager {
     if (!pc) return;
 
     try {
-      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      if (pc.signalingState === 'have-local-offer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(answer));
+      } else {
+        console.log(`[P2P] Ignoring answer in state: ${pc.signalingState}`);
+      }
     } catch (err) {
       console.error('[P2P] Error handling answer:', err);
     }
@@ -251,24 +357,116 @@ class P2PManager {
     if (!pc) return;
 
     try {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      if (pc.remoteDescription) {
+        await pc.addIceCandidate(new RTCIceCandidate(candidate));
+      } else {
+        console.log(`[P2P] Buffering ICE candidate for ${from} (no remote description yet)`);
+        setTimeout(async () => {
+          if (pc.remoteDescription) {
+            try {
+              await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            } catch (e) {
+              console.error('[P2P] Error adding buffered ICE candidate:', e);
+            }
+          }
+        }, 1000);
+      }
     } catch (err) {
       console.error('[P2P] Error adding ICE candidate:', err);
     }
   }
 
+  async _attemptIceRestart(peerId, pc) {
+    console.log(`[P2P] Attempting ICE restart for ${peerId}`);
+
+    if (!pc || pc.connectionState === 'closed') {
+      this._schedulePeerReconnect(peerId);
+      return;
+    }
+
+    try {
+      const offer = await pc.createOffer({ iceRestart: true });
+      await pc.setLocalDescription(offer);
+      this._sendSignaling({
+        type: 'offer',
+        from: this.nodeId,
+        targetId: peerId,
+        roomId: this.roomId,
+        payload: offer
+      });
+    } catch (err) {
+      console.error('[P2P] ICE restart failed:', err);
+      this._schedulePeerReconnect(peerId);
+    }
+  }
+
+  _handlePeerConnectionFailed(peerId, pc) {
+    console.log(`[P2P] Handling peer connection failure for ${peerId}`);
+
+    if (pc && pc.connectionState !== 'closed') {
+      try {
+        pc.close();
+      } catch (e) {}
+    }
+
+    this.peerConnections.delete(peerId);
+    this.peers.delete(peerId);
+
+    this._schedulePeerReconnect(peerId);
+  }
+
+  _schedulePeerReconnect(peerId) {
+    const attempts = this.peerReconnectAttempts.get(peerId) || 0;
+
+    if (attempts >= this.maxPeerReconnectAttempts) {
+      console.log(`[P2P] Max peer reconnect attempts reached for ${peerId}`);
+      this._emit('peer-disconnected', { peerId, permanent: true });
+      return;
+    }
+
+    const newAttempts = attempts + 1;
+    this.peerReconnectAttempts.set(peerId, newAttempts);
+
+    const delay = Math.min(this.peerReconnectDelay * Math.pow(1.5, newAttempts - 1), 30000);
+
+    console.log(`[P2P] Scheduling reconnect for ${peerId} in ${delay}ms (attempt ${newAttempts}/${this.maxPeerReconnectAttempts})`);
+    this._emit('peer-reconnecting', { peerId, attempt: newAttempts, delay });
+
+    setTimeout(() => {
+      if (!this.isConnected) return;
+      const currentPc = this.peerConnections.get(peerId);
+      if (currentPc && currentPc.connectionState === 'connected') {
+        console.log(`[P2P] Already connected to ${peerId}, skipping reconnect`);
+        return;
+      }
+      this._initiateConnection(peerId, true, true);
+    }, delay);
+  }
+
   _setupDataChannel(channel, peerId) {
     this.dataChannels.set(peerId, channel);
+
+    channel.binaryType = 'arraybuffer';
 
     channel.onopen = () => {
       console.log(`[P2P] Data channel open with ${peerId}`);
       this.peers.set(peerId, true);
+      this.peerReconnectAttempts.set(peerId, 0);
       this._emit('peer-connected', { peerId });
+      this._flushMessageQueue(peerId);
     };
 
     channel.onmessage = (event) => {
       try {
-        const data = JSON.parse(event.data);
+        let data;
+        if (typeof event.data === 'string') {
+          data = JSON.parse(event.data);
+        } else if (event.data instanceof ArrayBuffer) {
+          data = JSON.parse(new TextDecoder().decode(event.data));
+        } else {
+          data = JSON.parse(event.data);
+        }
+
         console.log(`[P2P] Received message from ${peerId}:`, data.type);
         this._emit('message', { peerId, data });
       } catch (err) {
@@ -283,11 +481,72 @@ class P2PManager {
     channel.onclose = () => {
       console.log(`[P2P] Data channel closed with ${peerId}`);
       this.peers.delete(peerId);
+      this.dataChannels.delete(peerId);
       this._emit('peer-disconnected', { peerId });
+    };
+
+    channel.onbufferedamountlow = () => {
+      this._flushMessageQueue(peerId);
     };
   }
 
-  _cleanupPeer(peerId) {
+  _queueMessage(peerId, message) {
+    if (!this.messageQueue.has(peerId)) {
+      this.messageQueue.set(peerId, []);
+    }
+    this.messageQueue.get(peerId).push({
+      message,
+      timestamp: Date.now()
+    });
+    console.log(`[P2P] Queued message for ${peerId}, queue size: ${this.messageQueue.get(peerId).length}`);
+  }
+
+  _flushMessageQueue(peerId) {
+    const queue = this.messageQueue.get(peerId);
+    if (!queue || queue.length === 0) return;
+
+    const dc = this.dataChannels.get(peerId);
+    if (!dc || dc.readyState !== 'open') {
+      console.log(`[P2P] Cannot flush queue for ${peerId}: channel not open`);
+      return;
+    }
+
+    console.log(`[P2P] Flushing ${queue.length} messages for ${peerId}`);
+
+    while (queue.length > 0 && dc.readyState === 'open') {
+      if (dc.bufferedAmount > 65536) {
+        console.log(`[P2P] Buffer full for ${peerId}, remaining: ${queue.length} messages`);
+        break;
+      }
+
+      const item = queue.shift();
+      try {
+        const messageStr = JSON.stringify(item.message);
+        dc.send(messageStr);
+      } catch (err) {
+        console.error('[P2P] Error sending queued message:', err);
+        queue.unshift(item);
+        break;
+      }
+    }
+  }
+
+  _requestSyncFromPeer(peerId) {
+    const localVC = {};
+    this._emit('vector-clock-update', {
+      peerId,
+      action: 'request',
+      callback: (vc) => {
+        this.sendToPeer(peerId, {
+          type: 'sync-request',
+          vectorClock: vc,
+          fromNodeId: this.nodeId
+        });
+      }
+    });
+  }
+
+  _cleanupPeer(peerId, emitEvent = true) {
     console.log(`[P2P] Cleaning up connection with ${peerId}`);
 
     const dc = this.dataChannels.get(peerId);
@@ -303,29 +562,43 @@ class P2PManager {
     }
 
     this.peers.delete(peerId);
+    this.peerIceGatheringStates.delete(peerId);
+
+    if (emitEvent) {
+      this._emit('peer-disconnected', { peerId });
+    }
   }
 
   sendToPeer(peerId, message) {
     const dc = this.dataChannels.get(peerId);
     if (dc && dc.readyState === 'open') {
-      dc.send(JSON.stringify(message));
-      return true;
+      try {
+        const messageStr = JSON.stringify(message);
+        dc.send(messageStr);
+        return { success: true, buffered: false };
+      } catch (err) {
+        console.error('[P2P] Error sending message:', err);
+        this._queueMessage(peerId, message);
+        return { success: false, buffered: true, error: err };
+      }
+    } else {
+      this._queueMessage(peerId, message);
+      return { success: false, buffered: true, reason: 'channel-not-open' };
     }
-    return false;
   }
 
   broadcast(message) {
     const results = [];
-    this.dataChannels.forEach((dc, peerId) => {
-      if (dc.readyState === 'open') {
-        try {
-          dc.send(JSON.stringify(message));
-          results.push({ peerId, success: true });
-        } catch (err) {
-          results.push({ peerId, success: false, error: err });
-        }
-      }
+    const peerIds = Array.from(new Set([
+      ...this.dataChannels.keys(),
+      ...this.peers.keys()
+    ]));
+
+    peerIds.forEach(peerId => {
+      const result = this.sendToPeer(peerId, message);
+      results.push({ peerId, ...result });
     });
+
     return results;
   }
 
@@ -354,14 +627,14 @@ class P2PManager {
 
   _handleReconnect() {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.log('[P2P] Max reconnect attempts reached');
+      console.log('[P2P] Max reconnect attempts reached for signaling server');
       return;
     }
 
     this.reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
 
-    console.log(`[P2P] Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+    console.log(`[P2P] Reconnecting to signaling in ${delay}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
 
     setTimeout(() => {
       this.connect().catch(err => {
@@ -370,8 +643,32 @@ class P2PManager {
     }, delay);
   }
 
+  setPeerVectorClock(peerId, vectorClock) {
+    this.peerVectorClocks.set(peerId, vectorClock);
+  }
+
+  getPeerVectorClock(peerId) {
+    return this.peerVectorClocks.get(peerId) || {};
+  }
+
+  getMessageQueueSize(peerId) {
+    const queue = this.messageQueue.get(peerId);
+    return queue ? queue.length : 0;
+  }
+
+  clearMessageQueue(peerId) {
+    if (this.messageQueue.has(peerId)) {
+      this.messageQueue.get(peerId).length = 0;
+    }
+  }
+
   disconnect() {
     console.log('[P2P] Disconnecting all peers');
+
+    this.messageQueue.clear();
+    this.peerReconnectAttempts.clear();
+    this.peerIceGatheringStates.clear();
+    this.peerVectorClocks.clear();
 
     this.dataChannels.forEach((dc, peerId) => {
       try { dc.close(); } catch (e) {}
@@ -394,16 +691,56 @@ class P2PManager {
   }
 
   getStatus() {
+    const peers = {};
+
+    this.peerConnections.forEach((pc, peerId) => {
+      const dc = this.dataChannels.get(peerId);
+      const isConnected = dc && dc.readyState === 'open';
+      const reconnecting = this.peerReconnectAttempts.get(peerId) > 0 && !isConnected;
+
+      peers[peerId] = {
+        connected: isConnected,
+        reconnecting: reconnecting,
+        reconnectAttempts: this.peerReconnectAttempts.get(peerId) || 0,
+        iceConnectionState: pc.iceConnectionState,
+        dataChannelState: dc ? dc.readyState : 'closed',
+        queueSize: this.messageQueue.get(peerId)?.length || 0
+      };
+    });
+
+    const queueSizes = {};
+    this.messageQueue.forEach((queue, peerId) => {
+      queueSizes[peerId] = queue.length;
+    });
+
     return {
       nodeId: this.nodeId,
       roomId: this.roomId,
       isSignalingConnected: this.isConnected,
       peerCount: this.getPeerCount(),
-      peers: this.getConnectedPeers(),
+      connectedPeers: this.getConnectedPeers(),
+      peers: peers,
       peerStates: Object.fromEntries(
         Array.from(this.peerConnections.entries()).map(([id, pc]) => [id, pc.connectionState])
+      ),
+      iceStates: Object.fromEntries(this.peerIceGatheringStates),
+      reconnectAttempts: Object.fromEntries(this.peerReconnectAttempts),
+      messageQueueSizes: queueSizes,
+      dataChannelStates: Object.fromEntries(
+        Array.from(this.dataChannels.entries()).map(([id, dc]) => [id, dc.readyState])
       )
     };
+  }
+
+  _simulateIceFailure(peerId) {
+    const pc = this.peerConnections.get(peerId);
+    if (!pc) {
+      throw new Error(`Peer ${peerId} not found`);
+    }
+
+    console.log(`[P2PManager] Simulating ICE failure for peer ${peerId}`);
+    this._emit('ice-failed', { peerId, state: 'failed' });
+    this._handlePeerConnectionFailed(peerId, pc);
   }
 }
 

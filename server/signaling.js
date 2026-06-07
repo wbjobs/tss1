@@ -6,8 +6,9 @@ const path = require('path');
 const PORT = process.env.PORT || 8080;
 
 const server = http.createServer((req, res) => {
-  let filePath = '.' + req.url;
-  if (filePath === './') {
+  const urlPath = req.url.split('?')[0];
+  let filePath = './client' + urlPath;
+  if (filePath === './client/' || filePath === './client') {
     filePath = './client/index.html';
   }
 

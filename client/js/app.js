@@ -12,12 +12,16 @@ class App {
   }
 
   _generateNodeId() {
-    const stored = localStorage.getItem('p2p-node-id');
-    if (stored) return stored;
+    try {
+      const stored = localStorage.getItem('p2p-node-id');
+      if (stored) return stored;
 
-    const newId = `node-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
-    localStorage.setItem('p2p-node-id', newId);
-    return newId;
+      const newId = `node-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+      localStorage.setItem('p2p-node-id', newId);
+      return newId;
+    } catch (e) {
+      return `node-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    }
   }
 
   _initElements() {
@@ -46,6 +50,10 @@ class App {
 
     this.statusDisplayEl = document.getElementById('statusDisplay');
     this.logPanelEl = document.getElementById('logPanel');
+
+    this.testNestedBtn = document.getElementById('testNestedBtn');
+    this.testSimulateBtn = document.getElementById('testSimulateBtn');
+    this.testConcurrentBtn = document.getElementById('testConcurrentBtn');
 
     this.addConfigModal = document.getElementById('addConfigModal');
     this.configKeyInput = document.getElementById('configKeyInput');
@@ -95,6 +103,10 @@ class App {
       if (e.target === this.importModal) this._hideImportModal();
     });
 
+    this.testNestedBtn.addEventListener('click', () => this._testNestedMerge());
+    this.testSimulateBtn.addEventListener('click', () => this._testSimulateIceFailure());
+    this.testConcurrentBtn.addEventListener('click', () => this._testConcurrentModifications());
+
     setInterval(() => this._updateStatus(), 2000);
   }
 
@@ -141,13 +153,15 @@ class App {
 
   _setupConfigSyncListeners() {
     this.configSync.on('config-changed', (data) => {
-      this._log(`配置变更: ${JSON.stringify(data)}`, data.remote ? 'info' : 'success');
+      const changeDesc = data.key || data.path || '';
+      this._log(`配置变更: ${changeDesc} ${data.remote ? '(远程)' : '(本地)'}`, data.remote ? 'info' : 'success');
       this._updateUI();
     });
 
     this.configSync.on('operation-applied', (data) => {
       const source = data.local ? '本地' : `远程(${data.from})`;
-      this._log(`操作应用 [${source}]: ${data.operation.type} ${data.operation.key}`, 'info');
+      const conflict = data.conflict ? ' [冲突已解决]' : '';
+      this._log(`操作应用 [${source}]: ${data.operation.type} ${data.operation.path || data.operation.key}${conflict}`, data.conflict ? 'warning' : 'info');
     });
 
     this.configSync.on('peer-connected', (data) => {
@@ -155,9 +169,32 @@ class App {
       this._updatePeers();
     });
 
+    this.configSync.on('peer-reconnected', (data) => {
+      this._log(`节点重连成功: ${data.peerId}`, 'success');
+      this._updatePeers();
+    });
+
+    this.configSync.on('peer-reconnecting', (data) => {
+      this._log(`节点正在重连: ${data.peerId} (第${data.attempt}次尝试`, 'warning');
+      this._updatePeers();
+    });
+
     this.configSync.on('peer-disconnected', (data) => {
       this._log(`节点已断开: ${data.peerId}`, 'warning');
       this._updatePeers();
+    });
+
+    this.configSync.on('ice-failed', (data) => {
+      this._log(`ICE连接失败: ${data.peerId}，将尝试重连...`, 'error');
+    });
+
+    this.configSync.on('sync-started', (data) => {
+      this._log(`开始同步: ${data.peerId}`, 'info');
+    });
+
+    this.configSync.on('sync-complete', (data) => {
+      const type = data.incremental ? '增量' : '全量';
+      this._log(`同步完成: ${data.peerId} (${type}, ${data.operationCount || 0}个操作)`, 'success');
     });
 
     this.configSync.on('connected', (data) => {
@@ -486,23 +523,48 @@ class App {
   _updatePeers() {
     if (!this.configSync) return;
 
-    const peers = this.configSync.p2p.getConnectedPeers();
-    this.peerCountEl.textContent = peers.length;
+    const status = this.configSync.getStatus();
+    const peers = status.peers || {};
+    const peerCount = Object.keys(peers).length;
+    this.peerCountEl.textContent = peerCount;
 
-    if (peers.length === 0) {
+    if (peerCount === 0) {
       this.peersListEl.innerHTML = '<div class="empty-state">暂无连接的节点</div>';
       return;
     }
 
     let html = '';
-    peers.forEach(peerId => {
+    for (const [peerId, peerStatus] of Object.entries(peers)) {
+      const vc = status.peerVectorClocks ? status.peerVectorClocks[peerId] : null;
+      const vcDisplay = vc ? JSON.stringify(vc) : '-';
+      const statusText = peerStatus.connected ? '在线' : (peerStatus.reconnecting ? `重连中(${peerStatus.reconnectAttempts})` : '已断开');
+      const statusClass = peerStatus.connected ? 'peer-online' : (peerStatus.reconnecting ? 'peer-reconnecting' : 'peer-offline');
+      const queueSize = peerStatus.queueSize || 0;
+      const dataChannelState = peerStatus.dataChannelState || '-';
+
       html += `
         <div class="peer-item">
-          <span class="peer-id">${this._escapeHtml(peerId)}</span>
-          <span class="peer-status">在线</span>
+          <div class="peer-header">
+            <span class="peer-id">${this._escapeHtml(peerId.slice(-12))}</span>
+            <span class="peer-status ${statusClass}">${statusText}</span>
+          </div>
+          <div class="peer-details">
+            <div class="peer-detail-row">
+              <span class="peer-detail-label">通道:</span>
+              <span class="peer-detail-value">${dataChannelState}</span>
+            </div>
+            <div class="peer-detail-row">
+              <span class="peer-detail-label">队列:</span>
+              <span class="peer-detail-value">${queueSize} 条消息</span>
+            </div>
+            <div class="peer-detail-row peer-vc">
+              <span class="peer-detail-label">时钟:</span>
+              <span class="peer-detail-value">${this._escapeHtml(vcDisplay)}</span>
+            </div>
+          </div>
         </div>
       `;
-    });
+    }
 
     this.peersListEl.innerHTML = html;
   }
@@ -539,6 +601,100 @@ class App {
     while (this.logPanelEl.children.length > 100) {
       this.logPanelEl.removeChild(this.logPanelEl.firstChild);
     }
+  }
+
+  _testNestedMerge() {
+    if (!this.configSync) {
+      this._log('请先连接到服务器', 'error');
+      return;
+    }
+
+    this._log('=== 开始嵌套属性合并测试 ===', 'info');
+
+    this.configSync.set('test.a.b', 1, '设置 test.a.b = 1');
+    this._log('已设置 test.a.b = 1', 'success');
+
+    setTimeout(() => {
+      this.configSync.set('test.a.c', 2, '设置 test.a.c = 2');
+      this._log('已设置 test.a.c = 2', 'success');
+
+      setTimeout(() => {
+        const config = this.configSync.getConfig();
+        this._log(`最终 test 对象: ${JSON.stringify(config.test)}`, 'info');
+
+        if (config.test && config.test.a && config.test.a.b === 1 && config.test.a.c === 2) {
+          this._log('✅ 嵌套属性合并成功！两个属性都保留了', 'success');
+        } else {
+          this._log('❌ 嵌套属性合并失败！部分属性丢失', 'error');
+        }
+      }, 500);
+    }, 500);
+  }
+
+  _testSimulateIceFailure() {
+    if (!this.configSync) {
+      this._log('请先连接到服务器', 'error');
+      return;
+    }
+
+    const peers = this.configSync.p2p.getConnectedPeers();
+    if (peers.length === 0) {
+      this._log('当前没有连接的节点，无法模拟ICE失败', 'error');
+      return;
+    }
+
+    const peerId = peers[0];
+    this._log(`=== 模拟与 ${peerId.slice(-12)} 的ICE连接失败 ===`, 'warning');
+    this._log('这将触发自动重连机制和断点续传...', 'info');
+
+    this.configSync.set('test.ice.failure', Date.now(), 'ICE失败前的配置');
+    this._log('已设置测试配置，等待重连后验证同步', 'info');
+
+    try {
+      this.configSync.p2p._simulateIceFailure(peerId);
+      this._log('已触发ICE失败模拟，观察自动重连...', 'warning');
+    } catch (e) {
+      this._log(`模拟失败: ${e.message}`, 'error');
+    }
+  }
+
+  _testConcurrentModifications() {
+    if (!this.configSync) {
+      this._log('请先连接到服务器', 'error');
+      return;
+    }
+
+    const peers = this.configSync.p2p.getConnectedPeers();
+    if (peers.length === 0) {
+      this._log('当前没有连接的节点，请先打开另一个浏览器窗口并连接', 'warning');
+    }
+
+    this._log('=== 并发修改测试 ===', 'info');
+    this._log('请在另一个浏览器窗口同时执行以下操作：', 'info');
+    this._log('  节点A: 设置 concurrent.a = 1', 'info');
+    this._log('  节点B: 设置 concurrent.b = 2', 'info');
+    this._log('预期结果: concurrent 对象同时包含 a 和 b', 'info');
+
+    this.configSync.set('concurrent.a', 1, '节点A设置 concurrent.a');
+    this._log('本节点已设置 concurrent.a = 1', 'success');
+
+    setTimeout(() => {
+      const config = this.configSync.getConfig();
+      this._log(`当前 concurrent 对象: ${JSON.stringify(config.concurrent)}`, 'info');
+
+      if (config.concurrent && config.concurrent.a === 1 && config.concurrent.b === 2) {
+        this._log('✅ 并发修改合并成功！两个属性都保留了', 'success');
+      } else if (config.concurrent && config.concurrent.a === 1) {
+        this._log('⏳ 等待节点B的修改同步...', 'warning');
+        setTimeout(() => {
+          const config2 = this.configSync.getConfig();
+          this._log(`最终 concurrent 对象: ${JSON.stringify(config2.concurrent)}`, 'info');
+          if (config2.concurrent && config2.concurrent.a === 1 && config2.concurrent.b === 2) {
+            this._log('✅ 并发修改合并成功！', 'success');
+          }
+        }, 2000);
+      }
+    }, 3000);
   }
 
   _escapeHtml(str) {
